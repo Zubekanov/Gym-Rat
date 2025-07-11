@@ -1,7 +1,20 @@
 import tkinter as tk
-from typing import Tuple
+from tkinter import filedialog
+from typing import Tuple, Dict, Set
 import numpy as np
+import random
+import torch
+import torch.nn as nn
+from environment.popugame_env import PopuGameEnv, GreedyAgent, BlockerAgent
 
+env = PopuGameEnv()
+_OBS_SIZE = np.prod(env.observe(env.possible_agents[0]).shape)
+
+# === Hyperparameters for AI policy ===
+_ACTION_SIZE = 9 * 9  # same as grid_size**2
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# === Game constants ===
 _DEFAULT_SIZE = 9
 _DEFAULT_TURN_LIMIT = 40
 
@@ -18,117 +31,215 @@ grid_values = {
 	1: {"token": p1_token, "claim": p1_claim},
 }
 
-# ANSI escape codes for colors
-RESET = '\x1b[0m'
-FG_GREEN = '\x1b[32m'
+# ANSI escape codes for colors (console debug)
+RESET   = '\x1b[0m'
+FG_GREEN= '\x1b[32m'
 FG_BLUE = '\x1b[34m'
-BG_GREEN = '\x1b[42m'
+BG_GREEN= '\x1b[42m'
 BG_BLUE = '\x1b[44m'
 
+# === Policy network ===
+class PolicyNet(nn.Module):
+    def __init__(self, obs_size, action_size):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(4, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 9 * 9, 256), nn.ReLU(),
+            nn.Linear(256, action_size)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
 class PopuGameGUI:
-	def __init__(self, size=_DEFAULT_SIZE, turn_limit=_DEFAULT_TURN_LIMIT):
+	def __init__(
+		self,
+		size=_DEFAULT_SIZE,
+		turn_limit=_DEFAULT_TURN_LIMIT,
+	):
 		print("[DEBUG] Initializing PopuGameGUI")
 		self.grid_size = size
-		self.grid = np.zeros((self.grid_size, self.grid_size), dtype=int)
 		self.turn_limit = turn_limit
+
+		# prepare AI selection before showing main window
+		self.ai_players: Set[int] = set()
+		self.policies: Dict[int, PolicyNet] = {}
+		self._prompt_ai_selection()
+
+		# main window
+		self.grid = np.zeros((size, size), dtype=int)
 		self.turn = 0
+		self.player_selector = 0
+		self.legal_moves = {}
+		self.scores = [0, 0]
 
 		self.window = tk.Tk()
 		self.window.title("PopuGame")
-		self.buttons = [[None for _ in range(size)] for _ in range(size)]
-
-		self.player_selector = 0
-		self.legal_moves = None
-
-		self.scores = [0, 0]
+		self.buttons = [[None]*size for _ in range(size)]
 
 		self.create_widgets()
-		print("[DEBUG] Widgets created, now resetting game")
 		self.reset_game()
 		self.window.mainloop()
 
+	def _prompt_ai_selection(self):
+		root = tk.Tk(); root.withdraw()
+		sel  = tk.Toplevel(root)
+		sel.title("Player control")
+
+		# store choice: 0=Human,1=Policy,2=Greedy,3=Blocker
+		self.player_mode = {0: tk.IntVar(value=0), 1: tk.IntVar(value=0)}
+
+		for p, color in [(0,"green"),(1,"blue")]:
+			frame = tk.LabelFrame(sel, text=f"Player {p} ({color})")
+			frame.pack(fill="x", padx=10, pady=5)
+			for val, txt in [(0,"Human"), (1,"AI Policy"), (2,"Greedy"), (3,"Blocker")]:
+				tk.Radiobutton(frame, text=txt, variable=self.player_mode[p],
+							   value=val).pack(anchor="w")
+
+		def on_start():
+			for p in (0,1):
+				mode = self.player_mode[p].get()
+				name = "player_" + str(p)
+				if mode==1:
+					path = filedialog.askopenfilename(title=f"Checkpoint for P{p}")
+					if path:
+						self._load_policy(p,path)
+				elif mode==2:
+					self.policies[p] = GreedyAgent(env, name)
+				elif mode==3:
+					self.policies[p] = BlockerAgent(env, name)
+				if mode!=0:
+					self.ai_players.add(p)
+			sel.destroy(); root.quit()
+
+		tk.Button(sel, text="Start", command=on_start).pack(pady=10)
+		root.mainloop(); root.destroy()
+
+	def _load_policy(self, player:int, ckpt_path:str):
+		# compute once at module scope:
+		net = PolicyNet(_OBS_SIZE, _ACTION_SIZE).to(_DEVICE)
+		net.load_state_dict(torch.load(ckpt_path, map_location=_DEVICE))
+		net.eval()
+		self.policies[player] = net
+		self.ai_players.add(player)
+		print(f"[DEBUG] Loaded AI for player {player} from {ckpt_path}")
+
 	def create_widgets(self):
-		print("[DEBUG] Creating score and turn labels")
-		self.p0_score = tk.Label(self.window, text="Score: 0", font=("Arial", 10), fg="green")
-		self.p0_score.grid(row=0, column=0, columnspan=self.grid_size // 4, sticky="w")
-		self.turn_label = tk.Label(self.window, text="Turns Left: 0", font=("Arial", 10))
-		self.turn_label.grid(row=0, column=self.grid_size // 3, columnspan=self.grid_size // 3)
-		self.p1_score = tk.Label(self.window, text="Score: 0", font=("Arial", 10), fg="blue")
-		self.p1_score.grid(row=0, column=self.grid_size // 3 * 2, columnspan=self.grid_size // 4, sticky="w")
+		print("[DEBUG] Creating score & turn labels")
+		self.p0_score = tk.Label(self.window, text="Score: 0", fg="green")
+		self.p0_score.grid(row=0, column=0, columnspan=self.grid_size//4, sticky="w")
+		self.turn_label = tk.Label(self.window, text="Turns Left: 0")
+		self.turn_label.grid(row=0, column=self.grid_size//3, columnspan=self.grid_size//3)
+		self.p1_score = tk.Label(self.window, text="Score: 0", fg="blue")
+		self.p1_score.grid(row=0, column=(self.grid_size//3)*2, columnspan=self.grid_size//4, sticky="w")
+
 		print("[DEBUG] Creating grid buttons")
 		for r in range(self.grid_size):
 			for c in range(self.grid_size):
 				btn = tk.Button(
 					self.window,
 					text=" ",
-					width=3,
-					height=2,
+					width=3, height=2,
 					font=("Arial", 12),
 					command=lambda r=r, c=c: self.on_click(r, c)
 				)
 				btn.grid(row=r+1, column=c)
 				self.buttons[r][c] = btn
+
 		reset_btn = tk.Button(self.window, text="Reset", command=self.reset_game)
 		reset_btn.grid(row=self.grid_size+1, column=0, columnspan=self.grid_size, sticky="we")
-		print("[DEBUG] Reset button created")
 
-	def on_click(self, row, col):
-		print(f"[DEBUG] Button clicked at row={row}, col={col}")
-		action = row * self.grid_size + col
-		print(f"[DEBUG] Computed action={action}")
+	def on_click(self, row:int, col:int):
+		# only if human's turn
+		if self.player_selector in self.ai_players:
+			return
+		action = row*self.grid_size + col
+		self._step_and_advance(action)
+
+	def _step_and_advance(self, action:int):
 		self.step_game(action)
-		self.player_selector = 1 - self.player_selector if self.player_selector is not None else 0
-		print(f"[DEBUG] Next player selector={self.player_selector}")
+		self.player_selector ^= 1
+		self.update_button_states()
+		self.refresh_board_ui()
 
+		if self.turn >= self.turn_limit:
+			self.end_game()
+			return
+
+		# schedule AI move if needed
+		if self.player_selector in self.ai_players:
+			self.window.after(200, self.do_ai_move)
+
+	def do_ai_move(self):
+		p = self.player_selector
+		grid = self.grid.copy()
+		mask = self.legal_moves[p].flatten()
+
+		agent = self.policies[p]
+		if isinstance(agent, PolicyNet):
+			# existing policy case
+			obs_int   = torch.tensor(grid, dtype=torch.int64)
+			bit_masks = [0b0001,0b0010,0b0100,0b1000]
+			chans     = [(obs_int&m)!=0 for m in bit_masks]
+			obs_t     = torch.stack(chans,0).float().unsqueeze(0).to(_DEVICE)
+			with torch.no_grad():
+				logits = agent(obs_t).squeeze(0)
+				logits = logits.masked_fill(~torch.tensor(mask,device=_DEVICE), float("-inf"))
+				action = torch.distributions.Categorical(logits=logits).sample().item()
+		else:
+			# GreedyAgent or BlockerAgent
+			action = agent.act(grid, mask)
+
+		self._step_and_advance(action)
+
+
+	def update_button_states(self):
 		for x in range(self.grid_size):
 			for y in range(self.grid_size):
 				state = tk.NORMAL if self.legal_moves[self.player_selector][x][y] else tk.DISABLED
 				self.buttons[x][y].config(state=state)
-		print("[DEBUG] Button states updated based on legal moves")
-		self.scores[0] = np.sum(self.grid & grid_values[0]["claim"])//grid_values[0]["claim"]
-		self.scores[1] = np.sum(self.grid & grid_values[1]["claim"])//grid_values[1]["claim"]
-		self.refresh_board_ui()
-		if self.turn >= self.turn_limit:
-			self.end_game()
 
 	def end_game(self):
-		for btn in self.buttons:
-			for b in btn:
-				b.config(state=tk.DISABLED)
-		print("[DEBUG] Game over: turn limit reached")
-		winner_string = "Player 0 wins!" if self.scores[0] > self.scores[1] else "Player 1 wins!" if self.scores[1] > self.scores[0] else "It's a draw!"
-		self.turn_label.config(text=f"{winner_string}")
+		for row in self.buttons:
+			for btn in row:
+				btn.config(state=tk.DISABLED)
+		winner = ("Player 0 wins!" if self.scores[0]>self.scores[1]
+				  else "Player 1 wins!" if self.scores[1]>self.scores[0]
+				  else "It's a draw!")
+		self.turn_label.config(text=winner)
+		print(f"[DEBUG] Game over: {winner}")
 
 	def refresh_board_ui(self):
 		default_bg = "SystemButtonFace"
 		for x in range(self.grid_size):
 			for y in range(self.grid_size):
 				btn = self.buttons[x][y]
-				cell = self.grid[x, y]
-				if cell & grid_values[0]["claim"]:
-					bg = "lightgreen"
-				elif cell & grid_values[1]["claim"]:
-					bg = "lightblue"
-				else:
-					bg = default_bg
-				if cell & grid_values[0]["token"]:
-					text, fg = "X", "green"
-				elif cell & grid_values[1]["token"]:
-					text, fg = "O", "blue"
-				else:
-					text, fg = "", "black"
+				cell = self.grid[x,y]
+				if cell & p0_claim: bg="lightgreen"
+				elif cell & p1_claim: bg="lightblue"
+				else: bg=default_bg
+
+				if cell & p0_token: text,fg="X","green"
+				elif cell & p1_token: text,fg="O","blue"
+				else: text,fg="","black"
+
 				btn.config(bg=bg, text=text, fg=fg)
+
+		self.scores[0] = np.sum((self.grid & p0_claim)!=0)
+		self.scores[1] = np.sum((self.grid & p1_claim)!=0)
 		self.p0_score.config(text=f"Score: {self.scores[0]}")
 		self.p1_score.config(text=f"Score: {self.scores[1]}")
 		self.turn_label.config(text=f"Turns Left: {self.turn_limit - self.turn}")
-		print("[DEBUG] Board UI refreshed with claims and tokens")
+		print("[DEBUG] Board UI refreshed")
 
 	def reset_game(self):
-		print("[DEBUG] Resetting game state")
+		print("[DEBUG] Resetting game")
 		for row in self.buttons:
 			for btn in row:
-				if btn:
-					btn.config(text=" ", state="normal")
+				btn.config(text=" ", state=tk.NORMAL)
+
 		self.grid.fill(0)
 		self.turn = 0
 		self.player_selector = 0
@@ -136,9 +247,13 @@ class PopuGameGUI:
 			0: np.ones((self.grid_size, self.grid_size), dtype=bool),
 			1: np.ones((self.grid_size, self.grid_size), dtype=bool),
 		}
-		self.scores = [0, 0]
+		self.scores = [0,0]
+		self.update_button_states()
 		self.refresh_board_ui()
-		print("[DEBUG] Grid cleared, legal moves reset, turn=0, player_selector=0")
+
+		if self.player_selector in self.ai_players:
+			print(f"[DEBUG] AI player {self.player_selector} starts first")
+			self.window.after(200, self.do_ai_move)
 
 	def check_claim(self, player, row: int, col: int):
 		print(f"[DEBUG] check_claim called for player={player}, row={row}, col={col}")
@@ -303,10 +418,5 @@ class PopuGameGUI:
 		self.legal_moves[1] = ~occupied & ~c0
 		print(f"[DEBUG] Updated legal_moves for both players")
 
-	def run(self):
-		print("[DEBUG] Running mainloop")
-		self.window.mainloop()
-
 if __name__ == "__main__":
-	game = PopuGameGUI(size=_DEFAULT_SIZE, turn_limit=_DEFAULT_TURN_LIMIT)
-	game.run()
+	PopuGameGUI(size=_DEFAULT_SIZE, turn_limit=_DEFAULT_TURN_LIMIT)
